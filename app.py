@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 
-# --- IMPORTS (Correct LangChain Structure) ---
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_postgres import PGVector
@@ -9,7 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 
 # --- CONFIGURATION ---
-# Try to get keys from Streamlit secrets first, then fallback to environment variables
+
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
     NEON_CONNECTION_STRING = st.secrets["NEON_CONNECTION_STRING"]
@@ -28,12 +27,12 @@ if not NEON_CONNECTION_STRING:
 # --- INITIAL SETUP ---
 @st.cache_resource
 def load_resources():
-    # 1. Embedding Model (Free HuggingFace embeddings - no API key needed)
+    # 1. Embedding Model
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
     
-    # 2. Vector Database (NeonDB with pgvector - persistent storage!)
+    # 2. Vector Database
     vectordb = PGVector(
         connection=NEON_CONNECTION_STRING,
         embeddings=embedding_model,
@@ -41,7 +40,7 @@ def load_resources():
         use_jsonb=True
     )
     
-    # 3. Chat Model (Groq - super fast!)
+    # 3. Chat Model
     llm = ChatGroq(
         model="llama-3.3-70b-versatile",
         temperature=0,

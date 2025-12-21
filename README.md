@@ -1,6 +1,6 @@
-# Auto-Learning Chatbot
+# Chatbot
 
-A smart chatbot that automatically learns from conversations using Groq AI and NeonDB (PostgreSQL with pgvector).
+A chatbot that automatically learns from conversations using Groq AI and NeonDB (PostgreSQL with pgvector).
 
 ## Features
 - Automatic learning from conversations
@@ -37,22 +37,3 @@ Add your keys to `app.py` or use Streamlit secrets (recommended for deployment)
 ```bash
 streamlit run app.py
 ```
-
-## Deploy to Streamlit Cloud
-
-1. Push this repo to GitHub
-2. Go to https://share.streamlit.io
-3. Connect your repo
-4. In "Advanced settings" → "Secrets", add:
-   ```toml
-   GROQ_API_KEY = "your_groq_api_key"
-   NEON_CONNECTION_STRING = "postgresql://user:password@host/dbname"
-   ```
-5. Click "Deploy"
-
-## Why NeonDB?
-
-- **Persistent Memory**: Your chatbot remembers conversations even after restarts
-- **Free Tier**: 0.5 GB storage, plenty for a chatbot
-- **Fast**: Built on PostgreSQL with pgvector for efficient similarity search
-- **Scalable**: Easy to upgrade if you need more storage
