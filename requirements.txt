@@ -1,0 +1,9 @@
+langchain
+langchain-groq
+langchain-huggingface
+langchain-community
+langchain-postgres
+streamlit
+sentence-transformers
+psycopg2-binary
+pgvector
