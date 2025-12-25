@@ -79,18 +79,22 @@ Return ONLY: EPISODIC or SEMANTIC or BOTH or NONE"""),
 
 def extract_structured_facts(user_message, bot_response):
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Extract facts as: ENTITY1|RELATIONSHIP|ENTITY2|CONFIDENCE
+        ("system", """Extract facts with the USER'S NAME as the main entity.
 
-CONFIDENCE levels:
-- HIGH: Direct statement ("I am", "My name is", "I live in")
-- MEDIUM: Implied or mentioned casually
-- LOW: Uncertain ("I think", "maybe", "probably")
+Format: ENTITY1|RELATIONSHIP|ENTITY2|CONFIDENCE
+
+IMPORTANT: If user mentions their name, use THEIR NAME as entity1, not "User"
 
 Examples:
-"My name is Alex" → User|HAS_NAME|Alex|HIGH
-"I live in NYC" → User|LIVES_IN|NYC|HIGH
-"I think I like pizza" → User|LIKES|Pizza|LOW
-"Maybe I work as engineer" → User|WORKS_AS|Engineer|LOW
+"My name is Aaditya" → Aaditya|IS_NAMED|Aaditya|HIGH
+"I live in Delhi" → Aaditya|LIVES_IN|Delhi|HIGH (use the name if known)
+"I love pizza" → Aaditya|LIKES|Pizza|HIGH
+"I work as engineer" → Aaditya|WORKS_AS|Engineer|HIGH
+
+CONFIDENCE levels:
+- HIGH: Direct statement
+- MEDIUM: Implied
+- LOW: Uncertain
 
 One fact per line. Return NONE if no facts."""),
         ("human", f"User: {user_message}\nBot: {bot_response}\n\nExtract:")
@@ -229,8 +233,14 @@ def store_in_knowledge_graph(facts_text, user_message=""):
     
     # Detect if this is a correction
     is_correction = detect_correction_keywords(user_message)
+    
+    # Track the user's name for future facts
+    user_name = None
         
     with knowledge_graph.session() as session:
+        # Ensure ROOT node exists
+        session.run("MERGE (root:ROOT {name: 'ROOT'})")
+        
         for fact in facts:
             try:
                 parts = fact.split("|")
@@ -239,6 +249,10 @@ def store_in_knowledge_graph(facts_text, user_message=""):
                     rel = parts[1].strip()
                     e2 = parts[2].strip()
                     confidence = parts[3].strip() if len(parts) > 3 else "MEDIUM"
+                    
+                    # If this is a name fact, remember it
+                    if rel in ["IS_NAMED", "HAS_NAME"]:
+                        user_name = e2
                     
                     # Validate fact
                     if not validate_fact(e1, rel, e2, confidence):
@@ -255,32 +269,43 @@ def store_in_knowledge_graph(facts_text, user_message=""):
                         reason = "corrected" if is_correction else "updated"
                         update_fact_in_graph(e1, rel, contradiction, e2, reason)
                     else:
-                        # Create new fact
+                        # Create hierarchical structure:
+                        # ROOT -> Person -> Attributes
+                        
+                        # 1. Create/get Person node and link to ROOT
                         session.run("""
-                            MERGE (e1:Entity {name: $e1})
-                            MERGE (e2:Entity {name: $e2})
-                            MERGE (e1)-[r:RELATION {type: $rel}]->(e2)
+                            MERGE (root:ROOT {name: 'ROOT'})
+                            MERGE (person:Person {name: $person_name})
+                            MERGE (root)-[:HAS_USER]->(person)
+                        """, person_name=e1)
+                        
+                        # 2. Create attribute node and link to Person
+                        session.run("""
+                            MATCH (person:Person {name: $person_name})
+                            MERGE (attr:Attribute {name: $attr_name, type: $attr_type})
+                            MERGE (person)-[r:HAS_ATTRIBUTE {type: $rel_type}]->(attr)
                             SET r.timestamp = datetime(), 
                                 r.confidence = $confidence,
                                 r.priority = $priority
-                        """, e1=e1, e2=e2, rel=rel, confidence=confidence, priority=priority)
-            except:
+                        """, person_name=e1, attr_name=e2, attr_type=rel, rel_type=rel, 
+                             confidence=confidence, priority=priority)
+            except Exception as e:
                 pass
 
 def query_knowledge_graph(question):
     """Query Neo4j for relevant facts (excluding archived)."""
-    prompt = ChatPromptTemplate.from_messages([("system", "Extract main entity from question. Return only entity name."), ("human", question)])
-    entity = (prompt | llm).invoke({}).content.strip()
     with knowledge_graph.session() as session:
-        # Only get non-archived facts
-        results = session.run("""
-            MATCH (e1:Entity)-[r:RELATION]->(e2:Entity) 
-            WHERE (e1.name CONTAINS $entity OR e2.name CONTAINS $entity)
-            AND (r.archived IS NULL OR r.archived = false)
-            RETURN e1.name as e1, r.type as rel, e2.name as e2 
-            LIMIT 5
-        """, entity=entity)
-        return [f"{r['e1']} {r['rel']} {r['e2']}" for r in results]
+        # Query the hierarchical structure: ROOT -> Person -> Attributes
+        query = """
+        MATCH (root:ROOT)-[:HAS_USER]->(person:Person)-[r:HAS_ATTRIBUTE]->(attr:Attribute)
+        WHERE (r.archived IS NULL OR r.archived = false)
+        RETURN person.name as person, r.type as rel, attr.name as attribute
+        LIMIT 10
+        """
+        results = session.run(query)
+        facts = [f"{r['person']} {r['rel']} {r['attribute']}" for r in results]
+        
+        return facts if facts else []
 
 def store_episodic_memory(user_message, bot_response):
     doc = Document(page_content=f"User: {user_message}\nAssistant: {bot_response}", metadata={"memory_type": "episodic"})
