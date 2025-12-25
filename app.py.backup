@@ -1,0 +1,371 @@
+import streamlit as st
+import os
+
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_postgres import PGVector
+from langchain_pinecone import PineconeVectorStore
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
+from pinecone import Pinecone, ServerlessSpec
+from neo4j import GraphDatabase
+
+# --- CONFIGURATION ---
+
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    NEON_CONNECTION_STRING = st.secrets["NEON_CONNECTION_STRING"]
+    PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
+    NEO4J_URI = st.secrets["NEO4J_URI"]
+    NEO4J_USERNAME = st.secrets["NEO4J_USERNAME"]
+    NEO4J_PASSWORD = st.secrets["NEO4J_PASSWORD"]
+except:
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    NEON_CONNECTION_STRING = os.getenv("NEON_CONNECTION_STRING", "")
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+    NEO4J_URI = os.getenv("NEO4J_URI", "")
+    NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
+    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+
+if not GROQ_API_KEY:
+    st.error("⚠️ Please add your Groq API Key. Get one free at https://console.groq.com")
+    st.stop()
+
+if not PINECONE_API_KEY:
+    st.error("⚠️ Please add your Pinecone API Key. Get one free at https://www.pinecone.io")
+    st.stop()
+
+if not NEO4J_URI or not NEO4J_PASSWORD:
+    st.error("⚠️ Please add your Neo4j credentials. Get one free at https://neo4j.com/cloud/aura/")
+    st.stop()
+
+# --- INITIAL SETUP ---
+@st.cache_resource
+def load_resources():
+    # 1. Embedding Model
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    
+    # 2. Initialize Pinecone
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    # 3. Create Pinecone index if it doesn't exist
+    index_name = "episodic-memory"
+    
+    if index_name not in pc.list_indexes().names():
+        pc.create_index(
+            name=index_name,
+            dimension=384,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+    
+    # 4. Episodic Memory (Pinecone - conversations, context)
+    episodic_db = PineconeVectorStore(
+        index_name=index_name,
+        embedding=embedding_model,
+        pinecone_api_key=PINECONE_API_KEY
+    )
+    
+    # 5. Knowledge Graph (Neo4j - facts, relationships)
+    knowledge_graph = GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+    )
+    
+    # 6. Chat Model
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        temperature=0,
+        groq_api_key=GROQ_API_KEY
+    )
+    
+    return episodic_db, knowledge_graph, llm
+
+if GROQ_API_KEY and PINECONE_API_KEY and NEO4J_URI and NEO4J_PASSWORD:
+    episodic_db, knowledge_graph, llm = load_resources()
+
+# --- KNOWLEDGE GRAPH FUNCTIONS (PHASE 3: Neo4j Integration) ---
+
+def extract_structured_facts(user_message, bot_response):
+    """Extract entities and relationships for knowledge graph."""
+    extraction_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Extract structured facts as entities and relationships.
+
+Format: ENTITY1|RELATIONSHIP|ENTITY2
+
+Examples:
+- "My name is Alex" → User|HAS_NAME|Alex
+- "I live in NYC" → User|LIVES_IN|NYC
+- "I love pizza" → User|LIKES|Pizza
+- "I work as engineer" → User|WORKS_AS|Engineer
+- "Password for wifi is abc123" → WiFi|HAS_PASSWORD|abc123
+
+Return one fact per line. If no facts, return "NONE".
+"""),
+        ("human", f"User: {user_message}\nBot: {bot_response}\n\nExtract:")
+    ])
+    
+    chain = extraction_prompt | llm
+    result = chain.invoke({})
+    return result.content.strip()
+
+def store_in_knowledge_graph(facts_text):
+    """Store facts as nodes and relationships in Neo4j."""
+    if not facts_text or facts_text == "NONE":
+        return
+    
+    facts = [f.strip() for f in facts_text.split("\n") if f.strip() and "|" in f]
+    
+    with knowledge_graph.session() as session:
+        for fact in facts:
+            try:
+                parts = fact.split("|")
+                if len(parts) == 3:
+                    entity1, relationship, entity2 = parts
+                    
+                    # Create or merge nodes and relationship
+                    query = """
+                    MERGE (e1:Entity {name: $entity1})
+                    MERGE (e2:Entity {name: $entity2})
+                    MERGE (e1)-[r:RELATION {type: $relationship}]->(e2)
+                    SET r.timestamp = datetime()
+                    """
+                    session.run(query, entity1=entity1.strip(), entity2=entity2.strip(), relationship=relationship.strip())
+            except Exception as e:
+                st.warning(f"Failed to store fact: {fact}")
+
+def query_knowledge_graph(question):
+    """Query Neo4j for relevant facts."""
+    # Extract key entities from question
+    extraction_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Extract the main entity or topic from this question. Return ONLY the entity name, nothing else."),
+        ("human", question)
+    ])
+    
+    chain = extraction_prompt | llm
+    entity = chain.invoke({}).content.strip()
+    
+    # Query Neo4j
+    with knowledge_graph.session() as session:
+        query = """
+        MATCH (e1:Entity)-[r:RELATION]->(e2:Entity)
+        WHERE e1.name CONTAINS $entity OR e2.name CONTAINS $entity
+        RETURN e1.name as entity1, r.type as relationship, e2.name as entity2
+        LIMIT 5
+        """
+        results = session.run(query, entity=entity)
+        
+        facts = []
+        for record in results:
+            facts.append(f"{record['entity1']} {record['relationship']} {record['entity2']}")
+        
+        return facts
+
+# --- MEMORY FUNCTIONS (PHASE 1-3: Separated Memory Types) ---
+
+def classify_memory(user_message, bot_response):
+    """Classify if this is episodic (conversation) or semantic (fact) memory."""
+    classification_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a memory classifier. Analyze the conversation and determine what type of memory this is.
+
+EPISODIC MEMORY (conversations, context, discussions):
+- Greetings, casual chat
+- Questions and answers about general topics
+- Discussions, opinions, thoughts
+- Contextual information
+
+SEMANTIC MEMORY (facts, truths, stable information):
+- User's name, age, location
+- Preferences (likes, dislikes)
+- Personal facts (job, skills, relationships)
+- Passwords, important data
+- Stable truths about the user
+
+Return ONLY one word: "EPISODIC" or "SEMANTIC" or "BOTH" or "NONE"
+
+Examples:
+- "Hello, how are you?" → EPISODIC
+- "My name is Alex" → SEMANTIC
+- "I live in NYC and love pizza" → BOTH
+- "What's 2+2?" → NONE
+"""),
+        ("human", f"User: {user_message}\nBot: {bot_response}\n\nClassify:")
+    ])
+    
+    chain = classification_prompt | llm
+    result = chain.invoke({})
+    return result.content.strip().upper()
+    """Classify if this is episodic (conversation) or semantic (fact) memory."""
+    classification_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a memory classifier. Analyze the conversation and determine what type of memory this is.
+
+EPISODIC MEMORY (conversations, context, discussions):
+- Greetings, casual chat
+- Questions and answers about general topics
+- Discussions, opinions, thoughts
+- Contextual information
+
+SEMANTIC MEMORY (facts, truths, stable information):
+- User's name, age, location
+- Preferences (likes, dislikes)
+- Personal facts (job, skills, relationships)
+- Passwords, important data
+- Stable truths about the user
+
+Return ONLY one word: "EPISODIC" or "SEMANTIC" or "BOTH" or "NONE"
+
+Examples:
+- "Hello, how are you?" → EPISODIC
+- "My name is Alex" → SEMANTIC
+- "I live in NYC and love pizza" → BOTH
+- "What's 2+2?" → NONE
+"""),
+        ("human", f"User: {user_message}\nBot: {bot_response}\n\nClassify:")
+    ])
+    
+    chain = classification_prompt | llm
+    result = chain.invoke({})
+    return result.content.strip().upper()
+
+def extract_semantic_facts(user_message, bot_response):
+    """Extract structured facts from conversation."""
+    extraction_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Extract ONLY factual, stable information about the user.
+
+Return facts in this format:
+- User's name is [name]
+- User likes [thing]
+- User lives in [location]
+- User works as [job]
+- Password for [thing] is [password]
+
+If no facts, return "NONE".
+
+Examples:
+- "My name is Alex and I live in NYC" → "User's name is Alex\nUser lives in NYC"
+- "I love pizza" → "User likes pizza"
+- "Hello" → "NONE"
+"""),
+        ("human", f"User: {user_message}\nBot: {bot_response}\n\nExtract facts:")
+    ])
+    
+    chain = extraction_prompt | llm
+    result = chain.invoke({})
+    return result.content.strip()
+
+def store_episodic_memory(user_message, bot_response):
+    """Store conversation in episodic memory."""
+    conversation = f"User: {user_message}\nAssistant: {bot_response}"
+    doc = Document(
+        page_content=conversation,
+        metadata={
+            "memory_type": "episodic",
+            "timestamp": st.session_state.get("timestamp", ""),
+            "user_msg": user_message[:100]
+        }
+    )
+    episodic_db.add_documents([doc])
+
+def store_semantic_memory(facts):
+    """Store facts in knowledge graph (Neo4j)."""
+    store_in_knowledge_graph(facts)
+
+def process_and_store_memory(user_message, bot_response):
+    """Main memory processing: classify and store appropriately."""
+    import datetime
+    st.session_state["timestamp"] = datetime.datetime.now().isoformat()
+    
+    # Classify memory type
+    memory_type = classify_memory(user_message, bot_response)
+    
+    if memory_type == "EPISODIC":
+        store_episodic_memory(user_message, bot_response)
+    
+    elif memory_type == "SEMANTIC":
+        facts = extract_structured_facts(user_message, bot_response)
+        if facts and facts != "NONE":
+            store_semantic_memory(facts)
+    
+    elif memory_type == "BOTH":
+        # Store conversation in episodic
+        store_episodic_memory(user_message, bot_response)
+        # Extract and store facts in knowledge graph
+        facts = extract_structured_facts(user_message, bot_response)
+        if facts and facts != "NONE":
+            store_semantic_memory(facts)
+    
+    # If NONE, don't store anything
+
+def retrieve_episodic_memory(question, k=2):
+    """Retrieve relevant conversations from episodic memory."""
+    docs = episodic_db.similarity_search_with_score(question, k=k)
+    return [doc for doc, score in docs if score < 0.7]
+
+def retrieve_semantic_memory(question, k=2):
+    """Retrieve relevant facts from knowledge graph."""
+    return query_knowledge_graph(question)
+
+def ask_bot(question):
+    """Smart chatbot with episodic memory (Pinecone) and semantic memory (Neo4j)."""
+    # 1. Retrieve from both memory types
+    episodic_memories = retrieve_episodic_memory(question, k=2)
+    semantic_facts = retrieve_semantic_memory(question)
+    
+    # 2. Build context
+    context_parts = []
+    
+    if semantic_facts:
+        facts_text = "\n".join(semantic_facts)
+        context_parts.append(f"FACTS ABOUT USER:\n{facts_text}")
+    
+    if episodic_memories:
+        conversations = "\n\n".join([doc.page_content for doc in episodic_memories])
+        context_parts.append(f"PAST CONVERSATIONS:\n{conversations}")
+    
+    # 3. Generate response
+    if context_parts:
+        context = "\n\n".join(context_parts)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"You are a helpful AI assistant. Use the following information from your memory:\n\n{context}\n\nUse facts when relevant, and conversation context for continuity. Answer naturally."),
+            ("human", "{input}")
+        ])
+    else:
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful AI assistant. Answer questions naturally and conversationally."),
+            ("human", "{input}")
+        ])
+    
+    chain = prompt | llm
+    response = chain.invoke({"input": question})
+    return response.content
+
+# --- USER INTERFACE ---
+
+st.title("Chatbot")
+
+# Main Chat Interface
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask me anything..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        if "llm" in globals():
+            with st.spinner("Thinking..."):
+                response = ask_bot(prompt)
+                st.markdown(response)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                
+                # PHASE 1: Process and store memory with classification
+                process_and_store_memory(prompt, response)
+        else:
+            st.error("System not loaded. Check API Key.")
