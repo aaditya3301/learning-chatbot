@@ -3,7 +3,10 @@ langchain-groq
 langchain-huggingface
 langchain-community
 langchain-postgres
+langchain-pinecone
 streamlit
 sentence-transformers
 psycopg2-binary
 pgvector
+pinecone-client
+neo4j
